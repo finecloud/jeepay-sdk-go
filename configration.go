@@ -11,6 +11,7 @@ type Configuration struct {
 	Debug         bool              `json:"debug,omitempty"`
 	ApiId         string            `json:"apiId,omitempty"`
 	ApiKey        string            `json:"apiKey,omitempty"`
+	SignType      string            `json:"signType,omitempty"`
 	HTTPClient    *http.Client
 }
 
@@ -27,4 +28,11 @@ func NewConfiguration() *Configuration {
 // AddDefaultHeader adds a new HTTP header to the default header in the request
 func (c *Configuration) AddDefaultHeader(key string, value string) {
 	c.DefaultHeader[key] = value
+}
+
+func (c *Configuration) GetLocalBasePath() (string, error) {
+	if c.Host == "" {
+		return "", reportError("Host is empty")
+	}
+	return c.Host, nil
 }
