@@ -41,7 +41,8 @@ type APIClient struct {
 }
 
 type Service struct {
-	client *APIClient
+	client        *APIClient
+	Configuration *Configuration
 }
 
 // NewApiClient returns a new instance of the JeepayClient client.
@@ -53,6 +54,7 @@ func NewApiClient(cfg *Configuration) *APIClient {
 	c := &APIClient{}
 	c.cfg = cfg
 	c.common.client = c
+	c.common.Configuration = cfg
 
 	c.PayApi = (*PayApiService)(&c.common)
 	c.RefundApi = (*RefundApiService)(&c.common)

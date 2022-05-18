@@ -5,6 +5,7 @@ import (
 	_ioutil "io/ioutil"
 	_nethttp "net/http"
 	_neturl "net/url"
+	"time"
 )
 import _context "context"
 
@@ -65,6 +66,21 @@ func (p *PayApiService) PostOrderExecute(r OrderCreateRequest) (PayModel, *_neth
 	if localVarHTTPHeaderAccept != "" {
 		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
 	}
+
+	signType := "MD5"
+	r.PayModel.SignType = &signType
+	version := "1.0"
+	r.PayModel.Version = &version
+	micro := time.Now().UnixMicro()
+	r.PayModel.ReqTime = &micro
+	id := p.Configuration.ApiId
+	r.PayModel.AppId = &id
+	mapData := Struct2MapName(r.PayModel)
+	sign, err := encrypt(mapData, p.Configuration.ApiKey, p.Configuration.SignType)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+	r.PayModel.Sign = &sign
 
 	// body params
 	localVarPostBody = r.PayModel
