@@ -1,10 +1,29 @@
 package jeepay_go_sdk
 
 import (
-	"github.com/finecloud/jeepay-sdk-go/api"
+	"bytes"
+	"context"
+	"encoding/json"
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"strings"
+)
+
+var (
+	jsonCheck = regexp.MustCompile(`(?i:(?:application|text)/(?:vnd\.[^;]+\+)?json)`)
+	xmlCheck  = regexp.MustCompile(`(?i:(?:application|text)/xml)`)
 )
 
 type APIClient struct {
@@ -12,17 +31,18 @@ type APIClient struct {
 
 	common Service
 
-	PayApi *api.PayApiService
+	PayApi *PayApiService
 
-	RefundApi *api.RefundApiService
+	RefundApi *RefundApiService
 
-	SubAccountApi *api.SubAccountApiService
+	SubAccountApi *SubAccountApiService
 
-	TransferApi *api.TransferApiService
+	TransferApi *TransferApiService
 }
 
 type Service struct {
-	client *APIClient
+	client        *APIClient
+	Configuration *Configuration
 }
 
 // NewApiClient returns a new instance of the JeepayClient client.
@@ -34,14 +54,165 @@ func NewApiClient(cfg *Configuration) *APIClient {
 	c := &APIClient{}
 	c.cfg = cfg
 	c.common.client = c
+	c.common.Configuration = cfg
 
-	c.PayApi = (*api.PayApiService)(&c.common)
-	c.RefundApi = (*api.RefundApiService)(&c.common)
-	c.SubAccountApi = (*api.SubAccountApiService)(&c.common)
-	c.TransferApi = (*api.TransferApiService)(&c.common)
+	c.PayApi = (*PayApiService)(&c.common)
+	c.RefundApi = (*RefundApiService)(&c.common)
+	c.SubAccountApi = (*SubAccountApiService)(&c.common)
+	c.TransferApi = (*TransferApiService)(&c.common)
 
 	return c
 
+}
+
+// prepareRequest build the request
+func (c *APIClient) prepareRequest(
+	ctx context.Context,
+	path string, method string,
+	postBody interface{},
+	headerParams map[string]string,
+	queryParams url.Values,
+	formParams url.Values,
+	formFileName string,
+	fileName string,
+	fileBytes []byte) (localVarRequest *http.Request, err error) {
+
+	var body *bytes.Buffer
+
+	// Detect postBody type and post.
+	if postBody != nil {
+		contentType := headerParams["Content-Type"]
+		if contentType == "" {
+			contentType = detectContentType(postBody)
+			headerParams["Content-Type"] = contentType
+		}
+
+		body, err = setBody(postBody, contentType)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// add form parameters and file if available.
+	if strings.HasPrefix(headerParams["Content-Type"], "multipart/form-data") && len(formParams) > 0 || (len(fileBytes) > 0 && fileName != "") {
+		if body != nil {
+			return nil, errors.New("cannot specify postBody and multipart form at the same time")
+		}
+		body = &bytes.Buffer{}
+		w := multipart.NewWriter(body)
+
+		for k, v := range formParams {
+			for _, iv := range v {
+				if strings.HasPrefix(k, "@") { // file
+					err = addFile(w, k[1:], iv)
+					if err != nil {
+						return nil, err
+					}
+				} else { // form value
+					_ = w.WriteField(k, iv)
+				}
+			}
+		}
+		if len(fileBytes) > 0 && fileName != "" {
+			w.Boundary()
+			//_, fileNm := filepath.Split(fileName)
+			part, err := w.CreateFormFile(formFileName, filepath.Base(fileName))
+			if err != nil {
+				return nil, err
+			}
+			_, err = part.Write(fileBytes)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// Set the Boundary in the Content-Type
+		headerParams["Content-Type"] = w.FormDataContentType()
+
+		// Set Content-Length
+		headerParams["Content-Length"] = fmt.Sprintf("%d", body.Len())
+		_ = w.Close()
+	}
+
+	if strings.HasPrefix(headerParams["Content-Type"], "application/x-www-form-urlencoded") && len(formParams) > 0 {
+		if body != nil {
+			return nil, errors.New("Cannot specify postBody and x-www-form-urlencoded form at the same time.")
+		}
+		body = &bytes.Buffer{}
+		body.WriteString(formParams.Encode())
+		// Set Content-Length
+		headerParams["Content-Length"] = fmt.Sprintf("%d", body.Len())
+	}
+	pathStr := c.cfg.Scheme + "://" + path
+	// Generate a new request
+	if body != nil {
+		localVarRequest, err = http.NewRequest(method, pathStr, body)
+	} else {
+		localVarRequest, err = http.NewRequest(method, pathStr, nil)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// add header parameters, if any
+	if len(headerParams) > 0 {
+		headers := http.Header{}
+		for h, v := range headerParams {
+			headers.Set(h, v)
+		}
+		localVarRequest.Header = headers
+	}
+
+	// Add the user agent to the request.
+	localVarRequest.Header.Add("User-Agent", c.cfg.UserAgent)
+
+	for header, value := range c.cfg.DefaultHeader {
+		localVarRequest.Header.Add(header, value)
+	}
+	return localVarRequest, nil
+}
+
+func (c *APIClient) decode(v interface{}, b []byte, contentType string) (err error) {
+	if len(b) == 0 {
+		return nil
+	}
+	if s, ok := v.(*string); ok {
+		*s = string(b)
+		return nil
+	}
+	if f, ok := v.(**os.File); ok {
+		*f, err = ioutil.TempFile("", "HttpClientFile")
+		if err != nil {
+			return
+		}
+		_, err = (*f).Write(b)
+		if err != nil {
+			return
+		}
+		_, err = (*f).Seek(0, io.SeekStart)
+		return
+	}
+	if xmlCheck.MatchString(contentType) {
+		if err = xml.Unmarshal(b, v); err != nil {
+			return err
+		}
+		return nil
+	}
+	if jsonCheck.MatchString(contentType) {
+		if actualObj, ok := v.(interface{ GetActualInstance() interface{} }); ok { // oneOf, anyOf schemas
+			if unmarshalObj, ok := actualObj.(interface{ UnmarshalJSON([]byte) error }); ok { // make sure it has UnmarshalJSON defined
+				if err = unmarshalObj.UnmarshalJSON(b); err != nil {
+					return err
+				}
+			} else {
+				return errors.New("Unknown type with GetActualInstance but no unmarshalObj.UnmarshalJSON defined")
+			}
+		} else if err = json.Unmarshal(b, v); err != nil { // simple model
+			return err
+		}
+		return nil
+	}
+	return errors.New("undefined response type")
 }
 
 // callAPI do the request.
@@ -74,6 +245,117 @@ type GenericOpenAPIError struct {
 	body  []byte
 	error string
 	model interface{}
+}
+
+// selectHeaderContentType select a content type from the available list.
+func selectHeaderContentType(contentTypes []string) string {
+	if len(contentTypes) == 0 {
+		return ""
+	}
+	if contains(contentTypes, "application/json") {
+		return "application/json"
+	}
+	return contentTypes[0] // use the first content type specified in 'consumes'
+}
+
+// selectHeaderAccept join all accept types and return
+func selectHeaderAccept(accepts []string) string {
+	if len(accepts) == 0 {
+		return ""
+	}
+
+	if contains(accepts, "application/json") {
+		return "application/json"
+	}
+
+	return strings.Join(accepts, ",")
+}
+
+// contains is a case insensitive match, finding needle in a haystack
+func contains(haystack []string, needle string) bool {
+	for _, a := range haystack {
+		if strings.ToLower(a) == strings.ToLower(needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func reportError(format string, a ...interface{}) error {
+	return fmt.Errorf(format, a...)
+}
+
+// Add a file to the multipart request
+func addFile(w *multipart.Writer, fieldName, path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func(file *os.File) {
+		_ = file.Close()
+	}(file)
+
+	part, err := w.CreateFormFile(fieldName, filepath.Base(path))
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(part, file)
+
+	return err
+}
+
+// Set request body from an interface{}
+func setBody(body interface{}, contentType string) (bodyBuf *bytes.Buffer, err error) {
+	if bodyBuf == nil {
+		bodyBuf = &bytes.Buffer{}
+	}
+
+	if reader, ok := body.(io.Reader); ok {
+		_, err = bodyBuf.ReadFrom(reader)
+	} else if fp, ok := body.(**os.File); ok {
+		_, err = bodyBuf.ReadFrom(*fp)
+	} else if b, ok := body.([]byte); ok {
+		_, err = bodyBuf.Write(b)
+	} else if s, ok := body.(string); ok {
+		_, err = bodyBuf.WriteString(s)
+	} else if s, ok := body.(*string); ok {
+		_, err = bodyBuf.WriteString(*s)
+	} else if jsonCheck.MatchString(contentType) {
+		err = json.NewEncoder(bodyBuf).Encode(body)
+	} else if xmlCheck.MatchString(contentType) {
+		err = xml.NewEncoder(bodyBuf).Encode(body)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if bodyBuf.Len() == 0 {
+		err = fmt.Errorf("Invalid body type %s\n", contentType)
+		return nil, err
+	}
+	return bodyBuf, nil
+}
+
+// detectContentType method is used to figure out `ApiRequest.body` content type for request header
+func detectContentType(body interface{}) string {
+	contentType := "text/plain; charset=utf-8"
+	kind := reflect.TypeOf(body).Kind()
+
+	switch kind {
+	case reflect.Struct, reflect.Map, reflect.Ptr:
+		contentType = "application/json; charset=utf-8"
+	case reflect.String:
+		contentType = "text/plain; charset=utf-8"
+	default:
+		if b, ok := body.([]byte); ok {
+			contentType = http.DetectContentType(b)
+		} else if kind == reflect.Slice {
+			contentType = "application/json; charset=utf-8"
+		}
+	}
+
+	return contentType
 }
 
 // Error returns non-empty string if there was an error.
