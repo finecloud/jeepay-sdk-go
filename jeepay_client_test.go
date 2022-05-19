@@ -28,17 +28,15 @@ func TestPayApi(t *testing.T) {
 	newConfiguration.Host = host
 	newConfiguration.Scheme = schema
 	client := NewApiClient(newConfiguration)
-	order := client.PayApi.CreateOrder(context.Background())
-
 	amount := 4231
 	mchno := "M1652368247"
-	mchorderno := "test02"
-	waycode := "ALI_QR"
+	mchorderno := "test05"
+	waycode := AliWap
 	currency := "cny"
 	subject := "测试"
 	body := "测试"
 
-	order.PayModel = &PayModel{
+	request := PayCreateRequest{
 		Amount:     &amount,
 		MchNo:      &mchno,
 		MchOrderNo: &mchorderno,
@@ -48,7 +46,8 @@ func TestPayApi(t *testing.T) {
 		Body:       &body,
 	}
 
-	execute, response, err := client.PayApi.PostOrderExecute(order)
+	execute, response, err := client.PayApi.CreateOrder(context.Background(), request)
+
 	if err != nil {
 		t.Error(err)
 	}
